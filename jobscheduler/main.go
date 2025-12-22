@@ -4,90 +4,70 @@ import (
 	"fmt"
 	"sync"
 	"time"
+	"context"
 )
-
-const (
-	COMPLETED = iota
-	PENDING
-	CANCELLED
-)
-
-
-type TaskStatus int
 
 type Task struct {
 	name string
 	action func()
 	scheduledTime time.Time
-	status TaskStatus
 }
 
-func runJob(task *Task) {
-	delay := time.Until(task.scheduledTime)
-	if delay > 0 {
-		time.Sleep(delay)
-	}
-	switch task.status {
-	case PENDING:
+func runJob(ctx context.Context, task *Task) {
+	select {
+	case <- time.After(time.Until(task.scheduledTime)):
 		task.action()
-		task.status = COMPLETED
-	default:
+	case <- ctx.Done():
+		return
 	}
 }
 
-func runJobs(tasks []Task) {
+func runJobs(ctx context.Context, tasks []Task) {
 	var wg sync.WaitGroup
 	for i := 0; i < len(tasks); i++ {
 		wg.Add(1)
 		go func(task *Task) {
 			defer wg.Done()
-			runJob(task)
+			runJob(ctx, task)
 		}(&tasks[i])
 	}
 	wg.Wait()
-	fmt.Println(tasks)
 }
 
-func cancelJobs(tasks []Task) {
-	for i := 0; i < len(tasks); i++ {
-		switch tasks[i].status {
-		case PENDING:
-			tasks[i].status = CANCELLED
-		default:
-		}
-	}
+func cancelJobs(cancel context.CancelFunc) {
+	cancel()
 }
 
 
 func main() {
 	var wg sync.WaitGroup
-
 	tasks := []Task{
 		{
 			name: "Task - 01",
 			scheduledTime: time.Now().Add(time.Second * 4),
 			action: func() { fmt.Println("job 1 executed") },
-			status: PENDING,
 		},
 		{
 			name: "Task - 02",
 			scheduledTime: time.Now().Add(time.Second * 8),
 			action: func() { fmt.Println("job 2 executed") },
-			status: PENDING,
 		},
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runJobs(tasks)
+		runJobs(ctx, tasks)
+	}()
+	time.Sleep(time.Second * 6)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		cancelJobs(cancel)
 	}()
 
-	time.Sleep(5 * time.Second)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		cancelJobs(tasks)
-	}()
 	wg.Wait()
 }
