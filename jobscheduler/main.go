@@ -8,6 +8,8 @@ import (
 	"context"
 )
 
+const poolSize = 1
+
 type Scheduler struct {
 	tasks []Task
 	add chan Task
@@ -21,9 +23,9 @@ type Scheduler struct {
 }
 
 func NewScheduler(tasks []Task) *Scheduler {
-	add := make(chan Task)
-	execute := make(chan Task)
-	result := make(chan Task)
+	add := make(chan Task, 100)
+	execute := make(chan Task, 100)
+	result := make(chan Task, 100)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Scheduler{
@@ -49,22 +51,31 @@ type Task struct {
 }
 
 func (s *Scheduler) executeTasks() {
-	for {
-		select {
-		case v, ok := <- s.execute:
-			if !ok {
-				fmt.Println("Execute chan closed exiting...")
-				return
+	var wg sync.WaitGroup
+
+	for i := 0; i < poolSize; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			for {
+				select {
+				case v, ok := <- s.execute:
+					if !ok {
+						fmt.Println("Execute chan closed exiting...")
+						return
+					}
+					fmt.Printf("THREAD %d picked task %v", idx, v)
+					v.action()
+					s.result <- v
+				case <- s.ctx.Done():
+					fmt.Println("Cancelled called exiting ...")
+					return
+				}
 			}
-			go func(task Task) {
-				task.action()
-				s.result <- task
-			}(v)
-		case <- s.ctx.Done():
-			fmt.Println("Cancelled called exiting ...")
-			return
-		}
+		}(i)
 	}
+
+	wg.Wait()
 }
 
 
