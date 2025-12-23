@@ -8,7 +8,7 @@ import (
 	"context"
 )
 
-const poolSize = 2
+const poolSize = 1
 
 
 type Result struct {
@@ -30,9 +30,9 @@ type Scheduler struct {
 }
 
 func NewScheduler(tasks []Task) *Scheduler {
-	add := make(chan Task, 100)
-	execute := make(chan Task, 100)
-	result := make(chan Result, 100)
+	add := make(chan Task)
+	execute := make(chan Task)
+	result := make(chan Result)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Scheduler{
@@ -71,7 +71,6 @@ func (s *Scheduler) executeTasks() {
 						fmt.Println("Execute chan closed exiting...")
 						return
 					}
-					fmt.Printf("THREAD %d picked task %v", idx, v)
 					v.action()
 					s.result <- Result{task: v, finishedAt: time.Now(), err: nil}
 				case <- s.ctx.Done():
@@ -185,10 +184,13 @@ func (s *Scheduler) runJobs() {
 		case s.execute <- currTask:
 			// handoff succeeded, scheduler stays alive
 			s.tasks = s.tasks[1:]
-
 		case <-s.ctx.Done():
 			// shutdown beats scheduling
 			return
+		default:
+			fmt.Println("CHECKING 1234")
+			fmt.Println("Dropping task with name :: ", s.tasks[0].name)
+			s.tasks = s.tasks[1:]
 		}
 	}
 }
@@ -213,16 +215,16 @@ func main() {
 	var wg sync.WaitGroup
 	now := time.Now()
 	tasks := []Task{
-		{
-			name: "Task - 01",
-			scheduledTime: now.Add(time.Second * 4),
-			action: func() { fmt.Println("job 1 executed") },
-		},
-		{
-			name: "Task - 02",
-			scheduledTime: now.Add(time.Second * 8),
-			action: func() { fmt.Println("job 2 executed") },
-		},
+		// {
+		// 	name: "Task - 01",
+		// 	scheduledTime: now.Add(time.Second * 4),
+		// 	action: func() { fmt.Println("job 1 executed") },
+		// },
+		// {
+		// 	name: "Task - 02",
+		// 	scheduledTime: now.Add(time.Second * 8),
+		// 	action: func() { fmt.Println("job 2 executed") },
+		// },
 	}
 	s := NewScheduler(tasks)
 	s.orderTasks()
@@ -247,20 +249,31 @@ func main() {
 		defer wg.Done()
 		s.executeTasks()
 	}()
-	time.Sleep(time.Second * 1)
+	// time.Sleep(time.Second * 1)
 
 	newTask := Task{
 		name: "Task - 03",
 		scheduledTime: now.Add(time.Second * 3),
 		action: func() {
 			fmt.Println("job 3 executed")
-			time.Sleep(3 * time.Second)
+			time.Sleep(5 * time.Second)
 		},
-		repeatCount: 3,
-		interval: time.Second * 2,
+		repeatCount: 10,
+		interval: time.Second * 1,
+	}
+	newTask2 := Task{
+		name: "Task - 02",
+		scheduledTime: now.Add(time.Second * 3),
+		action: func() {
+			fmt.Println("job 2 executed")
+			time.Sleep(5 * time.Second)
+		},
+		repeatCount: 10,
+		interval: time.Second * 1,
 	}
 
 	s.addTask(newTask)
+	s.addTask(newTask2)
 
 	time.Sleep(time.Second * 20)
 
