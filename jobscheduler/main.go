@@ -14,6 +14,7 @@ type Scheduler struct {
 
 	ctx context.Context
 	cancel context.CancelFunc
+	timer *time.Timer
 }
 
 
@@ -54,8 +55,28 @@ func (s *Scheduler) runJobs() {
 			}
 		}
 
+		wait := time.Until(s.tasks[0].scheduledTime)
+		if wait < 0 {
+			wait = 0
+		}
+		if s.timer == nil {
+			s.timer = time.NewTimer(wait)
+		} else {
+			// Stop() tells you whether the timer had already fired
+			if !s.timer.Stop() {
+				// it must be running, just do away with the old value
+				select {
+				case <- s.timer.C:
+				default:
+				}
+			}
+			// And place the new value
+			s.timer.Reset(wait)
+		}
+
+
 		select {
-		case <- time.After(time.Until(s.tasks[0].scheduledTime)):
+		case <- s.timer.C:
 			s.tasks[0].action()
 			s.tasks = s.tasks[1:]
 		case <- s.ctx.Done():
@@ -72,6 +93,7 @@ func (s *Scheduler) runJobs() {
 	}
 }
 
+// addTask can block forever if 1. the scheduler exists, or is stuck in waiting sleep or the channel is never read again.
 func (s *Scheduler) addTask(task Task) {
 	s.add <- task
 }
