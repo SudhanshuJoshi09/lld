@@ -8,7 +8,14 @@ import (
 	"context"
 )
 
-const poolSize = 1
+const poolSize = 2
+
+
+type Result struct {
+	task       Task
+	finishedAt time.Time
+	err        error
+}
 
 type Scheduler struct {
 	tasks []Task
@@ -19,13 +26,13 @@ type Scheduler struct {
 	timer *time.Timer
 
 	execute chan Task
-	result chan Task
+	result chan Result
 }
 
 func NewScheduler(tasks []Task) *Scheduler {
 	add := make(chan Task, 100)
 	execute := make(chan Task, 100)
-	result := make(chan Task, 100)
+	result := make(chan Result, 100)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Scheduler{
@@ -66,7 +73,7 @@ func (s *Scheduler) executeTasks() {
 					}
 					fmt.Printf("THREAD %d picked task %v", idx, v)
 					v.action()
-					s.result <- v
+					s.result <- Result{task: v, finishedAt: time.Now(), err: nil}
 				case <- s.ctx.Done():
 					fmt.Println("Cancelled called exiting ...")
 					return
@@ -119,7 +126,7 @@ func (s *Scheduler) runJobs() {
 					fmt.Println("closed the result channel exiting...")
 					return
 				}
-				newTask := s.generateRecuringTask(v)
+				newTask := s.generateRecuringTask(v.task)
 				if newTask != nil {
 					s.tasks = append(s.tasks, *newTask)
 					s.orderTasks()
@@ -165,7 +172,7 @@ func (s *Scheduler) runJobs() {
 				fmt.Println("closed the result channel exiting...")
 				return
 			}
-			newTask := s.generateRecuringTask(v)
+			newTask := s.generateRecuringTask(v.task)
 			if newTask != nil {
 				s.tasks = append(s.tasks, *newTask)
 				s.orderTasks()
@@ -173,8 +180,16 @@ func (s *Scheduler) runJobs() {
 		}
 
 		currTask := s.tasks[0]
-		s.execute <- currTask
-		s.tasks = s.tasks[1:]
+
+		select {
+		case s.execute <- currTask:
+			// handoff succeeded, scheduler stays alive
+			s.tasks = s.tasks[1:]
+
+		case <-s.ctx.Done():
+			// shutdown beats scheduling
+			return
+		}
 	}
 }
 
