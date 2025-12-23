@@ -15,11 +15,15 @@ type Scheduler struct {
 	ctx context.Context
 	cancel context.CancelFunc
 	timer *time.Timer
-}
 
+	execute chan Task
+	result chan Task
+}
 
 func NewScheduler(tasks []Task) *Scheduler {
 	add := make(chan Task)
+	execute := make(chan Task)
+	result := make(chan Task)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Scheduler{
@@ -28,6 +32,9 @@ func NewScheduler(tasks []Task) *Scheduler {
 
 		ctx: ctx,
 		cancel: cancel,
+
+		execute: execute,
+		result: result,
 	}
 }
 
@@ -40,6 +47,47 @@ type Task struct {
 	repeatCount int
 	interval time.Duration
 }
+
+func (s *Scheduler) executeTasks() {
+	for {
+		select {
+		case v, ok := <- s.execute:
+			if !ok {
+				fmt.Println("Execute chan closed exiting...")
+				return
+			}
+			go func(task Task) {
+				task.action()
+				s.result <- task
+			}(v)
+		case <- s.ctx.Done():
+			fmt.Println("Cancelled called exiting ...")
+			return
+		}
+	}
+}
+
+
+func (s *Scheduler) generateRecuringTask(currTask Task) *Task {
+
+	currTask.repeatCount -= 1
+	if currTask.repeatCount > 0 {
+		next := currTask.scheduledTime.Add(currTask.interval)
+		now := time.Now()
+
+		if next.Before(now) {
+			missed := int(now.Sub(currTask.scheduledTime) / currTask.interval)
+			next = currTask.scheduledTime.Add(time.Duration(missed+1) * currTask.interval)
+		}
+
+		currTask.scheduledTime = next
+		fmt.Println(currTask.name, currTask.repeatCount)
+
+		return &currTask
+	}
+	return nil
+}
+
 
 func (s *Scheduler) runJobs() {
 	for true {
@@ -55,6 +103,16 @@ func (s *Scheduler) runJobs() {
 				}
 				s.tasks = append(s.tasks, v)
 				s.orderTasks()
+			case v, ok := <- s.result:
+				if !ok {
+					fmt.Println("closed the result channel exiting...")
+					return
+				}
+				newTask := s.generateRecuringTask(v)
+				if newTask != nil {
+					s.tasks = append(s.tasks, *newTask)
+					s.orderTasks()
+				}
 			}
 			continue
 		}
@@ -91,18 +149,21 @@ func (s *Scheduler) runJobs() {
 			s.tasks = append(s.tasks, v)
 			s.orderTasks()
 			continue
+		case v, ok := <- s.result:
+			if !ok {
+				fmt.Println("closed the result channel exiting...")
+				return
+			}
+			newTask := s.generateRecuringTask(v)
+			if newTask != nil {
+				s.tasks = append(s.tasks, *newTask)
+				s.orderTasks()
+			}
 		}
 
 		currTask := s.tasks[0]
-		currTask.action()
+		s.execute <- currTask
 		s.tasks = s.tasks[1:]
-
-		if currTask.repeatCount > 0 {
-			currTask.scheduledTime = currTask.scheduledTime.Add(currTask.interval)
-			currTask.repeatCount -= 1
-			s.tasks = append(s.tasks, currTask)
-			s.orderTasks()
-		}
 	}
 }
 
@@ -143,7 +204,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 10; i++ {
+		for {
 			fmt.Println(time.Now())
 			time.Sleep(1 * time.Second)
 		}
@@ -154,19 +215,28 @@ func main() {
 		defer wg.Done()
 		s.runJobs()
 	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.executeTasks()
+	}()
 	time.Sleep(time.Second * 1)
 
 	newTask := Task{
 		name: "Task - 03",
 		scheduledTime: now.Add(time.Second * 3),
-		action: func() { fmt.Println("job 3 executed") },
+		action: func() {
+			fmt.Println("job 3 executed")
+			time.Sleep(3 * time.Second)
+		},
 		repeatCount: 3,
 		interval: time.Second * 2,
 	}
 
 	s.addTask(newTask)
 
-	time.Sleep(time.Second * 5)
+	time.Sleep(time.Second * 20)
 
 	wg.Add(1)
 	go func() {
