@@ -36,6 +36,9 @@ type Task struct {
 	name string
 	action func()
 	scheduledTime time.Time
+
+	repeatCount int
+	interval time.Duration
 }
 
 func (s *Scheduler) runJobs() {
@@ -51,8 +54,9 @@ func (s *Scheduler) runJobs() {
 					return
 				}
 				s.tasks = append(s.tasks, v)
-				continue
+				s.orderTasks()
 			}
+			continue
 		}
 
 		wait := time.Until(s.tasks[0].scheduledTime)
@@ -77,8 +81,6 @@ func (s *Scheduler) runJobs() {
 
 		select {
 		case <- s.timer.C:
-			s.tasks[0].action()
-			s.tasks = s.tasks[1:]
 		case <- s.ctx.Done():
 			return
 		case v, ok := <- s.add:
@@ -89,6 +91,17 @@ func (s *Scheduler) runJobs() {
 			s.tasks = append(s.tasks, v)
 			s.orderTasks()
 			continue
+		}
+
+		currTask := s.tasks[0]
+		currTask.action()
+		s.tasks = s.tasks[1:]
+
+		if currTask.repeatCount > 0 {
+			currTask.scheduledTime = currTask.scheduledTime.Add(currTask.interval)
+			currTask.repeatCount -= 1
+			s.tasks = append(s.tasks, currTask)
+			s.orderTasks()
 		}
 	}
 }
@@ -147,19 +160,19 @@ func main() {
 		name: "Task - 03",
 		scheduledTime: now.Add(time.Second * 3),
 		action: func() { fmt.Println("job 3 executed") },
+		repeatCount: 3,
+		interval: time.Second * 2,
 	}
 
 	s.addTask(newTask)
 
-	time.Sleep(time.Second * 8)
+	time.Sleep(time.Second * 5)
 
-	close(s.add)
-
-	// wg.Add(1)
-	// go func() {
-	// 	defer wg.Done()
-	// 	s.cancelJobs()
-	// }()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.cancelJobs()
+	}()
 
 	wg.Wait()
 }
