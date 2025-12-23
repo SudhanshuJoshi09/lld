@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sort"
 	"fmt"
 	"sync"
 	"time"
@@ -13,31 +14,35 @@ type Task struct {
 	scheduledTime time.Time
 }
 
-func runJob(ctx context.Context, task *Task) {
-	select {
-	case <- time.After(time.Until(task.scheduledTime)):
-		task.action()
-	case <- ctx.Done():
-		return
-	}
-}
-
 func runJobs(ctx context.Context, tasks []Task) {
-	var wg sync.WaitGroup
+	now := time.Now()
 	for i := 0; i < len(tasks); i++ {
-		wg.Add(1)
-		go func(task *Task) {
-			defer wg.Done()
-			runJob(ctx, task)
-		}(&tasks[i])
+		wait := tasks[i].scheduledTime.Sub(now)
+
+		if wait > 0 {
+			select {
+			case <- time.After(wait):
+			case <- ctx.Done():
+				return
+			}
+		}
+
+		tasks[i].action()
+		now = tasks[i].scheduledTime
 	}
-	wg.Wait()
 }
 
 func cancelJobs(cancel context.CancelFunc) {
 	cancel()
 }
 
+
+func orderTasks(tasks []Task) []Task {
+	sort.Slice(tasks, func(i, j int) bool {
+		return tasks[i].scheduledTime.Before(tasks[j].scheduledTime)
+	})
+	return tasks
+}
 
 func main() {
 	var wg sync.WaitGroup
@@ -53,6 +58,7 @@ func main() {
 			action: func() { fmt.Println("job 2 executed") },
 		},
 	}
+	tasks = orderTasks(tasks)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
