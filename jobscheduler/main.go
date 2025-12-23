@@ -1,14 +1,20 @@
 package main
 
 import (
+	"os"
 	"sort"
 	"fmt"
 	"sync"
 	"time"
 	"context"
+	"encoding/json"
 )
 
-const poolSize = 1
+
+
+const poolSize = 2
+const fileName = "content.json"
+
 
 
 type Result struct {
@@ -23,6 +29,7 @@ type Scheduler struct {
 
 	ctx context.Context
 	cancel context.CancelFunc
+	stopped chan struct{}
 	timer *time.Timer
 
 	execute chan Task
@@ -33,6 +40,7 @@ func NewScheduler(tasks []Task) *Scheduler {
 	add := make(chan Task)
 	execute := make(chan Task)
 	result := make(chan Result)
+	stopped := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Scheduler{
@@ -44,17 +52,18 @@ func NewScheduler(tasks []Task) *Scheduler {
 
 		execute: execute,
 		result: result,
+		stopped: stopped,
 	}
 }
 
 
 type Task struct {
-	name string
+	Name string `json:"task_name"`
 	action func()
-	scheduledTime time.Time
+	ScheduledTime time.Time `json:"scheduled_time"`
 
-	repeatCount int
-	interval time.Duration
+	RepeatCount int `json:"repeat_count"`
+	Interval time.Duration `json:"interval"`
 }
 
 func (s *Scheduler) executeTasks() {
@@ -87,18 +96,16 @@ func (s *Scheduler) executeTasks() {
 
 func (s *Scheduler) generateRecuringTask(currTask Task) *Task {
 
-	currTask.repeatCount -= 1
-	if currTask.repeatCount > 0 {
-		next := currTask.scheduledTime.Add(currTask.interval)
+	currTask.RepeatCount -= 1
+	if currTask.RepeatCount > 0 {
+		next := currTask.ScheduledTime.Add(currTask.Interval)
 		now := time.Now()
 
 		if next.Before(now) {
-			missed := int(now.Sub(currTask.scheduledTime) / currTask.interval)
-			next = currTask.scheduledTime.Add(time.Duration(missed+1) * currTask.interval)
+			missed := int(now.Sub(currTask.ScheduledTime) / currTask.Interval)
+			next = currTask.ScheduledTime.Add(time.Duration(missed+1) * currTask.Interval)
 		}
-
-		currTask.scheduledTime = next
-		fmt.Println(currTask.name, currTask.repeatCount)
+		currTask.ScheduledTime = next
 
 		return &currTask
 	}
@@ -107,6 +114,8 @@ func (s *Scheduler) generateRecuringTask(currTask Task) *Task {
 
 
 func (s *Scheduler) runJobs() {
+	defer close(s.stopped)
+	defer  fmt.Println("RUNJOBS Closed \n")
 	for true {
 		if len(s.tasks) == 0 {
 			select {
@@ -134,7 +143,7 @@ func (s *Scheduler) runJobs() {
 			continue
 		}
 
-		wait := time.Until(s.tasks[0].scheduledTime)
+		wait := time.Until(s.tasks[0].ScheduledTime)
 		if wait < 0 {
 			wait = 0
 		}
@@ -187,10 +196,10 @@ func (s *Scheduler) runJobs() {
 		case <-s.ctx.Done():
 			// shutdown beats scheduling
 			return
-		default:
-			fmt.Println("CHECKING 1234")
-			fmt.Println("Dropping task with name :: ", s.tasks[0].name)
-			s.tasks = s.tasks[1:]
+		// default:
+		// 	fmt.Println("CHECKING 1234")
+		// 	fmt.Println("Dropping task with name :: ", s.tasks[0].Name)
+		// 	s.tasks = s.tasks[1:]
 		}
 	}
 }
@@ -207,36 +216,13 @@ func (s *Scheduler) cancelJobs() {
 
 func (s *Scheduler) orderTasks() {
 	sort.Slice(s.tasks, func(i, j int) bool {
-		return s.tasks[i].scheduledTime.Before(s.tasks[j].scheduledTime)
+		return s.tasks[i].ScheduledTime.Before(s.tasks[j].ScheduledTime)
 	})
 }
 
-func main() {
-	var wg sync.WaitGroup
-	now := time.Now()
-	tasks := []Task{
-		// {
-		// 	name: "Task - 01",
-		// 	scheduledTime: now.Add(time.Second * 4),
-		// 	action: func() { fmt.Println("job 1 executed") },
-		// },
-		// {
-		// 	name: "Task - 02",
-		// 	scheduledTime: now.Add(time.Second * 8),
-		// 	action: func() { fmt.Println("job 2 executed") },
-		// },
-	}
-	s := NewScheduler(tasks)
-	s.orderTasks()
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			fmt.Println(time.Now())
-			time.Sleep(1 * time.Second)
-		}
-	}()
+func (s *Scheduler) startScheduler() {
+	var wg sync.WaitGroup
 
 	wg.Add(1)
 	go func() {
@@ -249,38 +235,110 @@ func main() {
 		defer wg.Done()
 		s.executeTasks()
 	}()
-	// time.Sleep(time.Second * 1)
+
+	wg.Wait()
+}
+
+func clock() {
+	for {
+		fmt.Println(time.Now())
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func (s *Scheduler) storeSchedulerState() {
+	s.cancelJobs()
+	<- s.stopped
+	content, err := json.Marshal(s.tasks)
+	if err != nil {
+		fmt.Println(err)
+	}
+	os.WriteFile("content.json", content, 0644)
+}
+
+func (s *Scheduler) restoreTasks() []Task {
+	content, err := os.ReadFile("content.json")
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	result := make([]Task, 0)
+	err = json.Unmarshal(content, &result)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	for i := 0; i < len(result); i++ {
+		result[i].action = fetchAction(result[i].Name)
+	}
+	return result
+}
+
+
+func fetchAction(taskName string) func() {
+	switch taskName {
+	case "Task-03":
+		return func() {
+			fmt.Println("job 3 executed")
+			time.Sleep(2 * time.Second)
+		}
+	case "Task-02":
+		return func() {
+			fmt.Println("job 2 executed")
+			time.Sleep(2 * time.Second)
+		}
+	}
+	fmt.Println(taskName)
+	return func() { fmt.Println("Task not found") }
+}
+
+
+func main() {
+	var wg sync.WaitGroup
+	s := NewScheduler([]Task{})
+	now := time.Now()
+
+	// wg.Add(1)
+	// go func() {
+	// 	defer wg.Done()
+	// 	clock()
+	// }()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.startScheduler()
+	}()
+
 
 	newTask := Task{
-		name: "Task - 03",
-		scheduledTime: now.Add(time.Second * 3),
-		action: func() {
-			fmt.Println("job 3 executed")
-			time.Sleep(5 * time.Second)
-		},
-		repeatCount: 10,
-		interval: time.Second * 1,
+		Name: "Task-03",
+		ScheduledTime: now.Add(time.Second * 2),
+		action: fetchAction("Task-03"),
+		RepeatCount: 10,
+		Interval: time.Second * 1,
 	}
 	newTask2 := Task{
-		name: "Task - 02",
-		scheduledTime: now.Add(time.Second * 3),
-		action: func() {
-			fmt.Println("job 2 executed")
-			time.Sleep(5 * time.Second)
-		},
-		repeatCount: 10,
-		interval: time.Second * 1,
+		Name: "Task-02",
+		ScheduledTime: now.Add(time.Second * 1),
+		action: fetchAction("Task-02"),
+		RepeatCount: 10,
+		Interval: time.Second * 1,
 	}
 
 	s.addTask(newTask)
 	s.addTask(newTask2)
 
-	time.Sleep(time.Second * 20)
+	time.Sleep(10 * time.Second)
+	s.storeSchedulerState()
+
+	tasks := s.restoreTasks()
+	newS := NewScheduler(tasks)
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		s.cancelJobs()
+		newS.startScheduler()
 	}()
 
 	wg.Wait()
