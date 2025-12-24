@@ -13,24 +13,51 @@ import (
 )
 
 const (
-	SCHEDULED = iota
-	DISPATCHED
-	EXECUTED
-	SKIPPED_IDEMPOTENT
-	DROPPED
-	RESCHEDULED
-	SHUTDOWN
-	CANCELLED
+	EventScheduled = iota
+	EventDispatched
+	EventExecuted
+	EventSkippedIdempotent
+	EventDropped
+	EventRescheduled
+	EventShutdown
+	EventCancelled
+	EventFailed
+	EventRetryScheduled
 )
 
+const (
+	TaskExecuted = iota
+	TaskDropped
+	TaskCancelled
+	TaskFailed
+)
 
-const poolSize = 1
-const taskFileName = "tasks.json"
-const idempotencyFileName = "idempotency.json"
-const eventsFileName = "events.json"
+const (
+	TaskQueue = "TaskQueue"
+	RetryQueue = "RetryQueue"
+)
+
+const poolSize = 2
+const taskFileName = ".output/tasks.json"
+const idempotencyFileName = ".output/idempotency.json"
+const eventsFileName = ".output/events.json"
+const taskStateFileName = ".output/tasks.json"
+
+
+var defaultRetryPolicy RetryPolicy
+
+// NOTE: Initialize Config before running the program
+func initConfig() {
+	defaultRetryPolicy = RetryPolicy {
+		MaxRetries: 2,
+		BaseDelay: time.Second * 2,
+	}
+}
+
 
 
 type EventType int
+type ExecutionStatus int
 
 type Event struct {
 	Time time.Time
@@ -40,8 +67,7 @@ type Event struct {
 }
 
 type EventStore struct {
-	mu sync.Mutex
-	// TaskID -> []Event
+	mu sync.Mutex `json:"-"`
 	file string
 	EventMap map[string][]Event `json:"event_map"`
 	EventMetrics map[EventType][]Event `json:"event_type_metrics"`
@@ -54,24 +80,45 @@ type IdempotencyStore struct {
 	Seen map[string]bool `json:"executed_ids"`
 }
 
-type Result struct {
-	task       Task
-	finishedAt time.Time
-	err        error
+type ExecutionResult struct {
+	Task       Task
+	FinishedAt time.Time
+	Err        error
+	Attempts int
+	Result ExecutionStatus
 }
+
+
+type RetryPolicy struct {
+	MaxRetries int
+	BaseDelay time.Duration
+}
+
+func (p RetryPolicy) Decide(r ExecutionResult) (shouldRetry bool, delay time.Duration) {
+	allowedResultStatus := r.Result == TaskDropped || r.Result == TaskCancelled || r.Result == TaskFailed
+	shouldRetry = allowedResultStatus && (r.Attempts <= p.MaxRetries)
+	if shouldRetry {
+		return true, p.BaseDelay
+	}
+	return false, p.BaseDelay
+}
+
 
 type Scheduler struct {
 	tasks []Task
+	retries []RetryRequest
 	add chan Task
 
 	ctx context.Context
 	cancel context.CancelFunc
 	stopped chan struct{}
 	timer *time.Timer
+	timerCh <- chan time.Time
 
 	execute chan ExecutableTask
-	result chan Result
+	result chan ExecutionResult
 	event chan Event
+	retry chan RetryRequest
 
 	idempotencyStore *IdempotencyStore
 	eventStore *EventStore
@@ -81,10 +128,18 @@ type Scheduler struct {
 }
 
 type ExecutableTask struct {
-	Task Task
+	Task Task `json:"task"`
 
+	Attempts int
 	ctx context.Context
 	cancel context.CancelFunc
+}
+
+
+type RetryRequest struct {
+	Task Task
+	Attempt int
+	ReadyAt time.Time
 }
 
 type Task struct {
@@ -95,7 +150,36 @@ type Task struct {
 
 	RepeatCount int `json:"repeat_count"`
 	Interval time.Duration `json:"interval"`
+
+	RetryPolicy RetryPolicy `json:"retry_policy"`
 }
+
+
+func (t *Task) IsRecurring() bool {
+	return t.RepeatCount > 1
+}
+
+
+
+func NewTask(
+	name string,
+	scheduledTime time.Time,
+	repeatCount int,
+	interval time.Duration,
+	retryPolicy RetryPolicy,
+) Task {
+	taskID := fmt.Sprintf("%s@%d", name, scheduledTime.Unix())
+	return Task {
+		ID: taskID,
+		Name: name,
+		action: fetchAction(name),
+		ScheduledTime: scheduledTime,
+		RepeatCount: repeatCount,
+		Interval: interval,
+		RetryPolicy: retryPolicy,
+	}
+}
+
 
 
 func (es *EventStore) store(e Event) {
@@ -103,7 +187,7 @@ func (es *EventStore) store(e Event) {
 	es.EventMap[e.TaskID] = append(es.EventMap[e.TaskID], e)
 	es.EventMetrics[e.Type] = append(es.EventMetrics[e.Type], e)
 	es.mu.Unlock()
-	content, err := json.Marshal(*es)
+	content, err := json.Marshal(es)
 	if err != nil {
 		fmt.Println("Error while storing the event values", err)
 		return
@@ -144,12 +228,12 @@ func (es *EventStore) PrintTimeLine(taskID string) {
 func (es *EventStore) PrintSummary() {
 	fmt.Println("=== Scheduler Summary ===")
 
-	fmt.Printf("%-30s %d\n", "Tasks scheduled:", len(es.EventMetrics[SCHEDULED]))
-	fmt.Printf("%-30s %d\n", "Tasks dispatched:", len(es.EventMetrics[DISPATCHED]))
-	fmt.Printf("%-30s %d\n", "Tasks executed:", len(es.EventMetrics[EXECUTED]))
-	fmt.Printf("%-30s %d\n", "Tasks skipped (idempotent):", len(es.EventMetrics[SKIPPED_IDEMPOTENT]))
-	fmt.Printf("%-30s %d\n", "Tasks dropped:", len(es.EventMetrics[DROPPED]))
-	fmt.Printf("%-30s %d\n", "Tasks rescheduled:", len(es.EventMetrics[RESCHEDULED]))
+	fmt.Printf("%-30s %d\n", "Tasks scheduled:", len(es.EventMetrics[EventScheduled]))
+	fmt.Printf("%-30s %d\n", "Tasks dispatched:", len(es.EventMetrics[EventDispatched]))
+	fmt.Printf("%-30s %d\n", "Tasks executed:", len(es.EventMetrics[EventExecuted]))
+	fmt.Printf("%-30s %d\n", "Tasks skipped (idempotent):", len(es.EventMetrics[EventSkippedIdempotent]))
+	fmt.Printf("%-30s %d\n", "Tasks dropped:", len(es.EventMetrics[EventDropped]))
+	fmt.Printf("%-30s %d\n", "Tasks rescheduled:", len(es.EventMetrics[EventRescheduled]))
 }
 
 
@@ -208,9 +292,9 @@ func (s *IdempotencyStore) store(id string) {
 
 
 func NewScheduler() *Scheduler {
-	add := make(chan Task)
+	add := make(chan Task, 1000)
 	execute := make(chan ExecutableTask)
-	result := make(chan Result)
+	result := make(chan ExecutionResult)
 	event := make(chan Event, 1000)
 	stopped := make(chan struct{})
 
@@ -268,8 +352,9 @@ func (s *Scheduler) executeTasks() {
 				select {
 				case v, ok := <- s.execute:
 					task := v.Task
+					// NOTE: Future change would fix this with using the existing task IDs
 					if s.idempotencyStore.isPresent(v.Task.ID) {
-						s.event <- Event{Time: time.Now(), TaskID: task.ID, Type: SKIPPED_IDEMPOTENT}
+						s.event <- Event{Time: time.Now(), TaskID: task.ID, Type: EventSkippedIdempotent}
 						fmt.Println("Already seen task skipping", task.ID)
 						continue
 					}
@@ -281,15 +366,22 @@ func (s *Scheduler) executeTasks() {
 
 					go func() {
 						errCh <- task.action(v.ctx)
-						s.idempotencyStore.store(task.ID)
 					}()
 
 					select {
 					case <- v.ctx.Done():
-						s.event <- Event{Time: time.Now(), TaskID: task.ID, Type: CANCELLED}
+						s.event <- Event{Time: time.Now(), TaskID: task.ID, Type: EventCancelled}
+						s.result <- ExecutionResult{Task: task, FinishedAt: time.Now(), Err: v.ctx.Err(), Result: TaskCancelled, Attempts: v.Attempts}
 					case err := <- errCh:
-						s.event <- Event{Time: time.Now(), TaskID: task.ID, Type: EXECUTED}
-						s.result <- Result{task: task, finishedAt: time.Now(), err: err}
+						// NOTE: Policy - mark the failed events as something that were executed.
+						s.idempotencyStore.store(task.ID)
+						if err != nil {
+							s.event <- Event{Time: time.Now(), TaskID: task.ID, Type: EventFailed}
+							s.result <- ExecutionResult{Task: task, FinishedAt: time.Now(), Err: err, Result: TaskFailed, Attempts: v.Attempts}
+						} else {
+							s.event <- Event{Time: time.Now(), TaskID: task.ID, Type: EventExecuted}
+							s.result <- ExecutionResult{Task: task, FinishedAt: time.Now(), Err: err, Result: TaskExecuted, Attempts: v.Attempts}
+						}
 					}
 				case <- s.ctx.Done():
 					fmt.Println("Cancelled called exiting ...")
@@ -322,110 +414,202 @@ func (s *Scheduler) generateRecuringTask(currTask Task) *Task {
 	return nil
 }
 
+func (s *Scheduler) cleanUpTasks(r ExecutionResult) {
+	switch {
+	case r.Result == TaskExecuted || r.Result == TaskCancelled || r.Result == TaskFailed || r.Result == TaskDropped:
+		delete(s.inFlight, r.Task.ID)
+	default:
+	}
+}
 
-func (s *Scheduler) runJobs() {
-	defer close(s.stopped)
-	defer  fmt.Println("RUNJOBS Closed \n")
-	for true {
-		if len(s.tasks) == 0 {
-			select {
-			case <- s.ctx.Done():
-				fmt.Println("Cancel event triggered")
-				return
-			case v, ok := <- s.add:
-				if !ok {
-					fmt.Println("channel closed -> done")
-					return
-				}
-				s.tasks = append(s.tasks, v)
-				s.orderTasks()
-			case v, ok := <- s.result:
-				if !ok {
-					fmt.Println("closed the result channel exiting...")
-					return
-				}
-				newTask := s.generateRecuringTask(v.task)
-				if newTask != nil {
-					s.tasks = append(s.tasks, *newTask)
-					s.event <- Event{Time: time.Now(), TaskID: newTask.ID, Type: RESCHEDULED}
-					s.orderTasks()
-				}
-			}
-			continue
-		}
+func (s *Scheduler) rescheduleTask(r ExecutionResult) {
+	var scheduledTime time.Time
+	now := time.Now()
 
-		wait := time.Until(s.tasks[0].ScheduledTime)
-		if wait < 0 {
-			wait = 0
-		}
-		if s.timer == nil {
-			s.timer = time.NewTimer(wait)
+	task := r.Task
+	task.RepeatCount -= 1
+
+	scheduledTime = task.ScheduledTime.Add(task.Interval)
+	if scheduledTime.Before(now) {
+		missed := int(now.Sub(task.ScheduledTime) / task.Interval)
+		scheduledTime = task.ScheduledTime.Add(time.Duration(missed+1) * task.Interval)
+	}
+
+	task.ScheduledTime = scheduledTime
+	task.ID = fmt.Sprintf("%s@%d", task.Name, scheduledTime.Unix())
+
+	event := Event{Time: time.Now(), TaskID: r.Task.ID, Type: EventRescheduled}
+	s.addNewTaskInternal(task, event)
+}
+
+func (s *Scheduler) scheduleRetryTask(task Task, delay time.Duration, attempt int) {
+	now := time.Now()
+	scheduledTime := now.Add(delay)
+
+	task.ScheduledTime = scheduledTime
+	task.ID = fmt.Sprintf("%s@%d", task.Name, scheduledTime.Unix())
+
+	select {
+	case s.retry <- RetryRequest{ Task: task, Attempt: attempt + 1, ReadyAt: task.ScheduledTime}:
+	}
+}
+
+
+func (s *Scheduler) handleExecutionResult(r ExecutionResult) {
+	s.cleanUpTasks(r)
+
+	retryPolicy := r.Task.RetryPolicy
+	shouldRetry, delay := retryPolicy.Decide(r)
+
+	if shouldRetry {
+		s.scheduleRetryTask(r.Task, delay, r.Attempts)
+		return
+	}
+	if r.Task.IsRecurring() {
+		s.rescheduleTask(r)
+		return
+	}
+}
+
+func (s *Scheduler) addNewTaskInternal(t Task, event Event) {
+	s.event <- event
+	s.tasks = append(s.tasks, t)
+	s.orderTasks()
+}
+
+type RunningQueue string
+
+func (s *Scheduler) findRunningQueueResetTimer() RunningQueue {
+	// If both are empty then, there is no task that can be tried now.
+	if len(s.tasks) == 0 && len(s.retries) == 0 {
+		s.timerCh = nil
+		return ""
+	}
+
+	var wait time.Duration
+	var runningQueue RunningQueue
+
+	if len(s.tasks) != 0 {
+		wait = time.Until(s.tasks[0].ScheduledTime)
+		runningQueue = TaskQueue
+	} else if len(s.retries) != 0 {
+		wait = time.Until(s.retries[0].ReadyAt)
+		runningQueue = RetryQueue
+	} else if len(s.tasks) != 0 && len(s.retries) != 0 {
+		if s.tasks[0].ScheduledTime.Before(s.retries[0].ReadyAt) {
+			wait = time.Until(s.tasks[0].ScheduledTime)
+			runningQueue = TaskQueue
 		} else {
-			// Stop() tells you whether the timer had already fired
-			if !s.timer.Stop() {
-				// it must be running, just do away with the old value
-				select {
-				case <- s.timer.C:
-				default:
-				}
-			}
-			// And place the new value
-			s.timer.Reset(wait)
+			wait = time.Until(s.retries[0].ReadyAt)
+			runningQueue = RetryQueue
 		}
+	}
 
+	if wait < 0 {
+		wait = 0
+	}
+	if s.timer == nil {
+		s.timer = time.NewTimer(wait)
+	} else {
+		if !s.timer.Stop() {
+			select {
+			case <- s.timer.C:
+			default:
+			}
+		}
+		s.timer.Reset(wait)
+	}
+	s.timerCh = s.timer.C
+	return runningQueue
+}
+
+func (s *Scheduler) processRunningQueueEntry(runningQueue RunningQueue) {
+	var executableTask ExecutableTask
+	switch runningQueue {
+	case TaskQueue:
+		ctx, cancel := context.WithCancel(s.ctx)
+		task := s.tasks[0]
+		executableTask = ExecutableTask{Task: task, ctx: ctx}
+		s.inFlight[task.ID] = cancel
 
 		select {
-		case <- s.timer.C:
+		case s.execute <- executableTask:
+			s.event <- Event{Time: time.Now(), TaskID: task.ID, Type: EventDispatched}
+			s.tasks = s.tasks[1:]
+		case <-s.ctx.Done():
+			return
+		default:
+			s.event <- Event{Time: time.Now(), TaskID: task.ID, Type: EventDropped}
+			s.result <- ExecutionResult{FinishedAt: time.Now(), Task: task, Result: TaskDropped}
+			s.tasks = s.tasks[1:]
+		}
+	case RetryQueue:
+		ctx, cancel := context.WithCancel(s.ctx)
+		retryTask := s.retries[0]
+		task := retryTask.Task
+		executableTask = ExecutableTask{Task: task, ctx: ctx, Attempts: retryTask.Attempt}
+		s.inFlight[retryTask.Task.ID] = cancel
+
+		select {
+		case s.execute <- executableTask:
+			s.event <- Event{Time: time.Now(), TaskID: task.ID, Type: EventDispatched}
+			s.retries = s.retries[1:]
+		case <-s.ctx.Done():
+			return
+		default:
+			s.event <- Event{Time: time.Now(), TaskID: task.ID, Type: EventDropped}
+			s.result <- ExecutionResult{FinishedAt: time.Now(), Task: task, Result: TaskDropped}
+			s.retries = s.retries[1:]
+		}
+	}
+}
+
+func (s *Scheduler) runJobs() {
+	// NOTE: Closing the function this is required.
+	defer close(s.stopped)
+	defer  fmt.Printf("\n\n ----------- RUNJOBS Closed ------------ \n\n")
+
+
+	for {
+		// Reset the timer at the start.
+		runningQueue := s.findRunningQueueResetTimer()
+		select {
+		case <- s.timerCh:
+			s.processRunningQueueEntry(runningQueue)
 		case <- s.ctx.Done():
+			fmt.Println("Cancelled called for scheduler")
 			return
 		case v, ok := <- s.add:
 			if !ok {
 				fmt.Println("done")
 				return
 			}
-			s.tasks = append(s.tasks, v)
-			s.orderTasks()
-			continue
-		case v, ok := <- s.result:
+			event := Event{Time: time.Now(), TaskID: v.ID, Type: EventScheduled}
+			s.addNewTaskInternal(v, event)
+		case result, ok := <- s.result:
 			if !ok {
 				fmt.Println("closed the result channel exiting...")
 				return
 			}
-			newTask := s.generateRecuringTask(v.task)
-			if newTask != nil {
-				s.tasks = append(s.tasks, *newTask)
-				s.event <- Event{Time: time.Now(), TaskID: newTask.ID, Type: RESCHEDULED}
-				s.orderTasks()
+			s.handleExecutionResult(result)
+		case r, ok := <- s.retry:
+			if !ok {
+				fmt.Println("retry queue closed exiting...")
+				return
 			}
-		}
-
-		ctx, cancel := context.WithCancel(s.ctx)
-		currTask := s.tasks[0]
-		executableTask := ExecutableTask{Task: currTask, ctx: ctx}
-		s.inFlight[currTask.ID] = cancel
-
-		select {
-		case s.execute <- executableTask:
-			s.event <- Event{Time: time.Now(), TaskID: currTask.ID, Type: DISPATCHED}
-			s.tasks = s.tasks[1:]
-		case <-s.ctx.Done():
-			return
-		// default:
-		// 	fmt.Println("CHECKING 1234")
-		// 	fmt.Println("Dropping task with name :: ", s.tasks[0].Name)
-		// 	s.event <- Event{Time: time.Now(), TaskID: currTask.ID, Type: DROPPED}
-		// 	s.tasks = s.tasks[1:]
+			s.event <- Event{Time: time.Now(), TaskID: r.Task.ID, Type: EventRetryScheduled}
+			s.retries = append(s.retries, r)
+			s.orderRetries()
 		}
 	}
 }
 
 // addTask can block forever if 1. the scheduler exists, or is stuck in waiting sleep or the channel is never read again.
-func (s *Scheduler) addTask(task Task) {
-	s.event <- Event{Time: time.Now(), TaskID: task.ID, Type: SCHEDULED}
+func (s *Scheduler) AddNewTask(task Task) {
 	s.add <- task
 }
 
-func (s *Scheduler) cancelJobs() {
+func (s *Scheduler) CancelJobs() {
 	s.cancel()
 }
 
@@ -440,6 +624,13 @@ func (s *Scheduler) orderTasks() {
 	sort.Slice(s.tasks, func(i, j int) bool {
 		return s.tasks[i].ScheduledTime.Before(s.tasks[j].ScheduledTime)
 	})
+}
+
+func (s *Scheduler) orderRetries() {
+	sort.Slice(s.retries, func(i, j int) bool {
+		return s.retries[i].ReadyAt.Before(s.retries[j].ReadyAt)
+	})
+
 }
 
 
@@ -468,19 +659,19 @@ func clock() {
 	}
 }
 
-func (s *Scheduler) storeSchedulerState() {
-	s.cancelJobs()
+func (s *Scheduler) StoreSchedulerState() {
+	s.CancelJobs()
 	<- s.stopped
 	content, err := json.Marshal(s.tasks)
 	fmt.Println(s.tasks)
 	if err != nil {
 		fmt.Println(err)
 	}
-	os.WriteFile("content.json", content, 0644)
+	os.WriteFile(taskStateFileName, content, 0644)
 }
 
 func restoreTasks() []Task {
-	content, err := os.ReadFile("content.json")
+	content, err := os.ReadFile(taskStateFileName)
 	if err != nil {
 		fmt.Println(err)
 	}
@@ -522,6 +713,13 @@ func fetchAction(taskName string) func(ctx context.Context) error {
 			fmt.Println("end writing ...")
 			return nil
 		}
+	case "Task-05":
+		work = func() error {
+			fmt.Println("TASK - 05 start")
+			time.Sleep(1 * time.Second)
+			fmt.Println("TASK - 05 end")
+			return fmt.Errorf("ERROR in task - 05")
+		}
 	default:
 		work = func() error {
 			fmt.Println("Default action triggered")
@@ -542,6 +740,9 @@ func fetchAction(taskName string) func(ctx context.Context) error {
 }
 
 func main() {
+
+	initConfig()
+
 	var wg sync.WaitGroup
 	s := NewScheduler()
 	now := time.Now()
@@ -559,25 +760,33 @@ func main() {
 		s.startScheduler()
 	}()
 
-	newTask := Task{
-		Name: "Task-03",
-		ScheduledTime: now.Add(time.Second * 2),
-		action: fetchAction("Task-03"),
-		RepeatCount: 20,
-		Interval: time.Second * 1,
-	}
-	newTask2 := Task{
-		Name: "Task-04",
-		ScheduledTime: now.Add(time.Second * 1),
-		action: fetchAction("Task-04"),
-		Interval: time.Second * 1,
-		RepeatCount: 20,
-	}
-	newTask2.ID = fmt.Sprintf("%s@%d", newTask2.Name, newTask2.ScheduledTime.Unix())
-	newTask.ID = fmt.Sprintf("%s@%d", newTask.Name, newTask.ScheduledTime.Unix())
+	newTask := NewTask(
+		"Task-03",
+		now.Add(time.Second * 2),
+		20,
+		time.Second * 1,
+		defaultRetryPolicy,
+	)
 
-	s.addTask(newTask)
-	s.addTask(newTask2)
+	newTask2 := NewTask(
+		"Task-04",
+		now.Add(time.Second * 1),
+		20,
+		time.Second * 1,
+		defaultRetryPolicy,
+	)
+
+	newTask3 := NewTask(
+		"Task-05",
+		now.Add(time.Second * 1),
+		30,
+		time.Second * 8,
+		defaultRetryPolicy,
+	)
+
+	s.AddNewTask(newTask)
+	s.AddNewTask(newTask2)
+	s.AddNewTask(newTask3)
 
 	time.Sleep(10 * time.Second)
 
@@ -585,7 +794,7 @@ func main() {
 	s.eventStore.PrintTimeLine(newTask2.ID)
 
 	s.eventStore.PrintSummary()
-	s.storeSchedulerState()
+	s.StoreSchedulerState()
 	s.eventStore.PrintSummary()
 
 	newS := NewScheduler()
