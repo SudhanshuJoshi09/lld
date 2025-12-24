@@ -20,6 +20,7 @@ const (
 	DROPPED
 	RESCHEDULED
 	SHUTDOWN
+	CANCELLED
 )
 
 
@@ -46,6 +47,57 @@ type EventStore struct {
 	EventMetrics map[EventType][]Event `json:"event_type_metrics"`
 }
 
+type IdempotencyStore struct {
+	mu sync.Mutex
+
+	file string
+	Seen map[string]bool `json:"executed_ids"`
+}
+
+type Result struct {
+	task       Task
+	finishedAt time.Time
+	err        error
+}
+
+type Scheduler struct {
+	tasks []Task
+	add chan Task
+
+	ctx context.Context
+	cancel context.CancelFunc
+	stopped chan struct{}
+	timer *time.Timer
+
+	execute chan ExecutableTask
+	result chan Result
+	event chan Event
+
+	idempotencyStore *IdempotencyStore
+	eventStore *EventStore
+
+	inFlight  map[string]context.CancelFunc
+
+}
+
+type ExecutableTask struct {
+	Task Task
+
+	ctx context.Context
+	cancel context.CancelFunc
+}
+
+type Task struct {
+	ID string `json:"id"`
+	Name string `json:"task_name"`
+	action func(ctx context.Context) error
+	ScheduledTime time.Time `json:"scheduled_time"`
+
+	RepeatCount int `json:"repeat_count"`
+	Interval time.Duration `json:"interval"`
+}
+
+
 func (es *EventStore) store(e Event) {
 	es.mu.Lock()
 	es.EventMap[e.TaskID] = append(es.EventMap[e.TaskID], e)
@@ -62,7 +114,6 @@ func (es *EventStore) store(e Event) {
 		return
 	}
 }
-
 
 
 func (es *EventStore) load() {
@@ -111,13 +162,6 @@ func NewEventStore() *EventStore {
 }
 
 
-type IdempotencyStore struct {
-	mu sync.Mutex
-
-	file string
-	Seen map[string]bool `json:"executed_ids"`
-}
-
 func NewIdempotencyStore() *IdempotencyStore {
 	return &IdempotencyStore{
 		file: idempotencyFileName,
@@ -163,32 +207,9 @@ func (s *IdempotencyStore) store(id string) {
 }
 
 
-type Result struct {
-	task       Task
-	finishedAt time.Time
-	err        error
-}
-
-type Scheduler struct {
-	tasks []Task
-	add chan Task
-
-	ctx context.Context
-	cancel context.CancelFunc
-	stopped chan struct{}
-	timer *time.Timer
-
-	execute chan Task
-	result chan Result
-	event chan Event
-
-	idempotencyStore *IdempotencyStore
-	eventStore *EventStore
-}
-
 func NewScheduler() *Scheduler {
 	add := make(chan Task)
-	execute := make(chan Task)
+	execute := make(chan ExecutableTask)
 	result := make(chan Result)
 	event := make(chan Event, 1000)
 	stopped := make(chan struct{})
@@ -218,19 +239,11 @@ func NewScheduler() *Scheduler {
 
 		idempotencyStore: idempotencyStore,
 		eventStore: eventStore,
+
+		inFlight: make(map[string]context.CancelFunc),
 	}
 }
 
-
-type Task struct {
-	ID string `json:"id"`
-	Name string `json:"task_name"`
-	action func()
-	ScheduledTime time.Time `json:"scheduled_time"`
-
-	RepeatCount int `json:"repeat_count"`
-	Interval time.Duration `json:"interval"`
-}
 
 
 func (s *Scheduler) monitorEvents() {
@@ -254,19 +267,30 @@ func (s *Scheduler) executeTasks() {
 			for {
 				select {
 				case v, ok := <- s.execute:
-					if s.idempotencyStore.isPresent(v.ID) {
-						s.event <- Event{Time: time.Now(), TaskID: v.ID, Type: SKIPPED_IDEMPOTENT}
-						fmt.Println("Already seen task skipping", v.ID)
+					task := v.Task
+					if s.idempotencyStore.isPresent(v.Task.ID) {
+						s.event <- Event{Time: time.Now(), TaskID: task.ID, Type: SKIPPED_IDEMPOTENT}
+						fmt.Println("Already seen task skipping", task.ID)
 						continue
 					}
 					if !ok {
 						fmt.Println("Execute chan closed exiting...")
 						return
 					}
-					v.action()
-					s.idempotencyStore.store(v.ID)
-					s.event <- Event{Time: time.Now(), TaskID: v.ID, Type: EXECUTED}
-					s.result <- Result{task: v, finishedAt: time.Now(), err: nil}
+					errCh := make(chan error, 1)
+
+					go func() {
+						errCh <- task.action(v.ctx)
+						s.idempotencyStore.store(task.ID)
+					}()
+
+					select {
+					case <- v.ctx.Done():
+						s.event <- Event{Time: time.Now(), TaskID: task.ID, Type: CANCELLED}
+					case err := <- errCh:
+						s.event <- Event{Time: time.Now(), TaskID: task.ID, Type: EXECUTED}
+						s.result <- Result{task: task, finishedAt: time.Now(), err: err}
+					}
 				case <- s.ctx.Done():
 					fmt.Println("Cancelled called exiting ...")
 					return
@@ -375,15 +399,16 @@ func (s *Scheduler) runJobs() {
 			}
 		}
 
+		ctx, cancel := context.WithCancel(s.ctx)
 		currTask := s.tasks[0]
+		executableTask := ExecutableTask{Task: currTask, ctx: ctx}
+		s.inFlight[currTask.ID] = cancel
 
 		select {
-		case s.execute <- currTask:
-			// handoff succeeded, scheduler stays alive
+		case s.execute <- executableTask:
 			s.event <- Event{Time: time.Now(), TaskID: currTask.ID, Type: DISPATCHED}
 			s.tasks = s.tasks[1:]
 		case <-s.ctx.Done():
-			// shutdown beats scheduling
 			return
 		// default:
 		// 	fmt.Println("CHECKING 1234")
@@ -401,8 +426,13 @@ func (s *Scheduler) addTask(task Task) {
 }
 
 func (s *Scheduler) cancelJobs() {
-	s.event <- Event{Time: time.Now(), Type: SHUTDOWN}
 	s.cancel()
+}
+
+func (s *Scheduler) cancelInFlightTask(taskID string) {
+	if cancel, ok := s.inFlight[taskID]; ok {
+		cancel()
+	}
 }
 
 
@@ -468,28 +498,47 @@ func restoreTasks() []Task {
 }
 
 
-func fetchAction(taskName string) func() {
+func fetchAction(taskName string) func(ctx context.Context) error {
+	var work func() error
+
 	switch taskName {
 	case "Task-03":
-		return func() {
+		work = func() error {
 			fmt.Println("job 3 executed")
 			time.Sleep(2 * time.Second)
+			return nil
 		}
 	case "Task-02":
-		return func() {
+		work = func() error {
 			fmt.Println("job 2 executed")
 			time.Sleep(2 * time.Second)
+			return nil
 		}
 	case "Task-04":
-		return func() {
+		work = func() error {
 			fmt.Println("start writing ...")
 			os.WriteFile("scracth", []byte("content"), 0644)
 			time.Sleep(2 * time.Second)
 			fmt.Println("end writing ...")
+			return nil
+		}
+	default:
+		work = func() error {
+			fmt.Println("Default action triggered")
+			return nil
 		}
 	}
-	fmt.Println(taskName)
-	return func() { fmt.Println("Task not found") }
+
+	wrapperFunc := func(ctx context.Context) error {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			return work()
+		}
+	}
+
+	return wrapperFunc
 }
 
 func main() {
