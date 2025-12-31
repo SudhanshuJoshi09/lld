@@ -14,8 +14,8 @@ type Task struct {
 	Description string `json:"description"`
 }
 
-func put(task Task) {
-	content, err := json.Marshal(task)
+func put(taskList []Task) {
+	content, err := json.Marshal(taskList)
 	if err != nil {
 		panic(err)
 	}
@@ -25,12 +25,12 @@ func put(task Task) {
 	}
 }
 
-func get() Task {
+func get() []Task {
 	content, err := os.ReadFile(fileName)
 	if err != nil {
 		panic(err)
 	}
-	var task Task
+	var task []Task
 	err = json.Unmarshal(content, &task)
 	if err != nil {
 		panic(err)
@@ -39,9 +39,19 @@ func get() Task {
 }
 
 func main() {
+	taskList := make([]Task, 0)
 	task := Task{Title: "Something", Description: "First ever task"}
+	task2 := Task{Title: "Something2", Description: "Second ever task"}
 
-	put(task)
-	newTask := get()
-	fmt.Println(newTask)
+	taskList = append(taskList, task)
+	put(taskList)
+
+	actualTaskList := get()
+	fmt.Println(actualTaskList)
+
+	taskList = append(taskList, task2)
+	put(taskList)
+
+	actualTaskList = get()
+	fmt.Println(actualTaskList)
 }
