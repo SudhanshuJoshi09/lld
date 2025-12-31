@@ -106,6 +106,7 @@ type IdempotencyStore struct {
 }
 
 type ExecutionResult struct {
+	ExecutionID string
 	Task       Task
 	FinishedAt time.Time
 	Err        error
@@ -113,6 +114,24 @@ type ExecutionResult struct {
 	Result ExecutionStatus
 }
 
+
+type ExecutableTask struct {
+	ExecutionID string `json:"execution_id"`
+	Task Task `json:"task"`
+
+	Attempts int
+	ctx context.Context
+	cancel context.CancelFunc
+}
+
+type Execution struct {
+	ID string
+	TaskID string
+	CurrentAttempt int
+	MaxRetries int
+	Status ExecutionStatus
+	AppliedAttempts int
+}
 
 type RetryPolicy struct {
 	MaxRetries int
@@ -128,10 +147,11 @@ type RetryPolicy struct {
 
 // NOTE: retry scheduling is synchronous and bounded by MaxRetries.
 // No async buffering here by design.
-func (p RetryPolicy) Decide(r ExecutionResult) (shouldRetry bool, delay time.Duration) {
-	fmt.Printf("\n\n\nCOUNT ::: %d\n\n\n", r.Attempts)
-	allowedResultStatus := r.Result == TaskDropped || r.Result == TaskCancelled || r.Result == TaskFailed
-	shouldRetry = allowedResultStatus && (r.Attempts < p.MaxRetries)
+func (p RetryPolicy) Decide(e Execution) (shouldRetry bool, delay time.Duration) {
+	fmt.Printf("\n\n\nCOUNT ::: %d\n\n\n", e.CurrentAttempt)
+	// TODO: Change the status of the execution result currenlty the name still implies that we are working with tasks.
+	allowedResultStatus := e.Status == TaskDropped || e.Status == TaskCancelled || e.Status == TaskFailed
+	shouldRetry = allowedResultStatus && (e.AppliedAttempts < e.MaxRetries)
 	if shouldRetry {
 		return true, p.BaseDelay
 	}
@@ -158,16 +178,9 @@ type Scheduler struct {
 	eventStore *EventStore
 
 	inFlight  map[string]context.CancelFunc
-
+	executionState map[string]Execution
 }
 
-type ExecutableTask struct {
-	Task Task `json:"task"`
-
-	Attempts int
-	ctx context.Context
-	cancel context.CancelFunc
-}
 
 
 type RetryRequest struct {
@@ -361,6 +374,7 @@ func NewScheduler() *Scheduler {
 		eventStore: eventStore,
 
 		inFlight: make(map[string]context.CancelFunc),
+		executionState: make(map[string]Execution),
 	}
 }
 
@@ -508,19 +522,41 @@ func (s *Scheduler) scheduleRetryTask(task Task, delay time.Duration, attempt in
 	s.orderRetries()
 }
 
+func (s *Scheduler) updateExecutionState(r ExecutionResult) {
+	executionID := r.ExecutionID
+	prevState := s.executionState[executionID]
+	newState := Execution {
+		ID: prevState.ID,
+		TaskID: prevState.TaskID,
+		CurrentAttempt: prevState.CurrentAttempt,
+		MaxRetries: prevState.MaxRetries,
+		// NOTE: Need to change the status logic over here. (There is a possiblity that retries contradict each other and we end up marking the new failed status)
+		Status: r.Result,
+		AppliedAttempts: max(prevState.AppliedAttempts, r.Attempts),
+	}
+
+	s.executionState[executionID] = newState
+}
+
+
+
 
 // NOTE: scheduling side-effects are synchronous (single-thread assumption)
 func (s *Scheduler) handleExecutionResult(r ExecutionResult) {
 	s.cleanUpTasks(r)
+	// NOTE: Before we make any descisions about rescheduling and retrying let's update the executionstate
+	s.updateExecutionState(r)
 
 	retryPolicy := r.Task.RetryPolicy
-	shouldRetry, delay := retryPolicy.Decide(r)
+	execution := s.executionState[r.ExecutionID]
+	shouldRetry, delay := retryPolicy.Decide(execution)
 
 	if shouldRetry {
 		fmt.Println(shouldRetry, r)
 		s.scheduleRetryTask(r.Task, delay, r.Attempts)
 		return
 	}
+
 	if r.Task.IsRecurring() {
 		s.rescheduleTask(r)
 		return
@@ -649,13 +685,19 @@ func (s *Scheduler) runJobs() {
 		runningQueue := s.findRunningQueueResetTimer()
 		fmt.Println("HERE - 1", runningQueue)
 		select {
+
+		// New task or retry get's picked up from here
 		case <- s.timerCh:
 			fmt.Println("HERE - 2")
 			s.processRunningQueueEntry(runningQueue)
+
+		// when we try cancelling the scheduler
 		case <- s.ctx.Done():
 			fmt.Println("HERE - 3")
 			logger.Println("Cancelled called for scheduler exiting... (runJobs)")
 			return
+
+		// When we get a new task to execute.
 		case v, ok := <- s.add:
 			fmt.Println("HERE - 4")
 			if !ok {
@@ -665,6 +707,8 @@ func (s *Scheduler) runJobs() {
 			event := Event{Time: time.Now(), TaskID: v.ID, Type: EventScheduled}
 			s.addNewTaskInternal(v, event)
 			fmt.Println(s.tasks)
+
+		// When we get a result of an execution.
 		case result, ok := <- s.result:
 			fmt.Println("HERE - 5")
 			if !ok {
