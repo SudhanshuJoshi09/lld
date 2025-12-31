@@ -12,6 +12,7 @@ const fileName = ".output/content.txt"
 type Task struct {
 	Title string `json:"name"`
 	Description string `json:"description"`
+	Done bool `json:"done"`
 }
 
 func put(taskList []Task) {
@@ -39,19 +40,18 @@ func get() []Task {
 }
 
 func main() {
-	taskList := make([]Task, 0)
-	task := Task{Title: "Something", Description: "First ever task"}
-	task2 := Task{Title: "Something2", Description: "Second ever task"}
-
+	// Adding precursor condition of loading the list from the memory and then appending items.
+	taskList := get()
+	task := Task{Title: "Something3", Description: "Third ever task"}
 	taskList = append(taskList, task)
-	put(taskList)
 
+	put(taskList)
 	actualTaskList := get()
-	fmt.Println(actualTaskList)
 
-	taskList = append(taskList, task2)
-	put(taskList)
+	actualTaskList[0].Done = true
+	put(actualTaskList)
 
-	actualTaskList = get()
-	fmt.Println(actualTaskList)
+	newActualTaskList := get()
+
+	fmt.Println(newActualTaskList)
 }
