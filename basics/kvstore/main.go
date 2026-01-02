@@ -26,6 +26,10 @@ func NewKVStore() *KVStore {
 	}
 }
 
+func (kv *KVStore) initKVStore() {
+	kv.readRecords()
+}
+
 
 func (kv *KVStore) get(key string) (string, error) {
 	currEntry, ok := kv.mapping[key]
@@ -62,19 +66,21 @@ func (kv *KVStore) writeRecords() {
 	os.WriteFile(fileName, byteContent, 0644)
 }
 
-func (kv *KVStore) readRecords() map[string]Record {
+func (kv *KVStore) readRecords() {
 	content, _ := os.ReadFile(fileName)
 	var result map[string]Record
 	json.Unmarshal(content, &result)
-	return result
+	kv.mapping = result
 }
 
 
 func main() {
 	kvstore := NewKVStore()
-	kvstore.set("Sudhanshu", "Joshi", time.Second * 2)
-	time.Sleep(4 * time.Second)
-	result, err := kvstore.get("Sudhanshu")
+	kvstore.initKVStore()
+
+	// kvstore.set("Sudhanshu10", "Joshi10", time.Second * 100)
+
+	result, err := kvstore.get("Sudhanshu10")
 	if err != nil {
 		fmt.Println(err)
 	}
