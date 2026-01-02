@@ -1,2 +1,3 @@
 .output/
 /job-scheduler/tmp/
+vendor/
